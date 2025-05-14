@@ -10,8 +10,8 @@ from tqdm import tqdm
 from utils.funcs import *
 from types import SimpleNamespace
 from dataset.dataset import XYProjectionFASERCALDataset
-# from model.networkAttention import MinkEncClsConvNeXtV2  # adjust path if needed
-from model.network import MinkEncClsConvNeXtV2  # adjust path if needed
+from model.networkAttention import MinkEncClsConvNeXtV2  # adjust path if needed
+# from model.network import MinkEncClsConvNeXtV2  # adjust path if needed
 
 
 

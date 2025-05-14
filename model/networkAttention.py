@@ -67,22 +67,20 @@ class OffsetAttentionLayer(nn.Module):
         residual = features.clone()
 
         # For MultiheadAttention, we need a 3D input: (B, N, C): we manually group features by batch 
+
+        # Group features by batch
         batch_ids = x.C[:, 0]
         unique_batches = batch_ids.unique()
-        grouped_features = []
-        inverse_indices = []
+        grouped_features = [features[batch_ids == b] for b in unique_batches]
 
-        for b in unique_batches:
-            idx = (batch_ids == b).nonzero(as_tuple=True)[0]
-            grouped_features.append(features[idx])
-            inverse_indices.extend(idx.tolist())
+        # Pad sequences
+        padded = pad_sequence(grouped_features, batch_first=True)  # [B, max_len, C]
+        lengths = torch.tensor([f.shape[0] for f in grouped_features], device=features.device)
+        key_padding_mask = torch.arange(padded.size(1), device=features.device)[None, :] >= lengths[:, None]
 
-        # Pad sequences to the same length
-        max_len = max(f.shape[0] for f in grouped_features)
-        padded = torch.stack([
-            F.pad(f, (0, 0, 0, max_len - f.shape[0])) for f in grouped_features
-        ])  # shape: [B, max_len, C]
-        attn_out, _ = self.attn(padded, padded, padded)  # Self-attention
+        # Apply attention
+        attn_out, _ = self.attn(padded, padded, padded, key_padding_mask=key_padding_mask)
+
         
         # print(self.attn.in_proj_weight.shape)
         # Remove padding and concatenate back
