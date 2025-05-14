@@ -61,12 +61,17 @@ class OffsetAttentionLayer(nn.Module):
         self.layer_nm = MinkowskiLayerNorm(embed_dim, eps=1e-6)
         self.relu = MinkowskiReLU()
 
-    def forward(self, x):
-        # Input features: (N_points, C)
-        features = x.F  # shape: [N, C]
-        residual = features.clone()
+        # Simpler positional encoding: 1 linear layer from (x, z) → embed_dim
+        self.pos_encoder = nn.Linear(2, embed_dim)
 
-        # For MultiheadAttention, we need a 3D input: (B, N, C): we manually group features by batch 
+    def forward(self, x):
+        features = x.F  # [N, C]
+        coords = x.C[:, 1:].float()  # [N, 2] for (x, z)
+
+        # Positional encoding
+        pos_enc = self.pos_encoder(coords)  # [N, embed_dim]
+        features = features + pos_enc
+        residual = features.clone()
 
         # Group features by batch
         batch_ids = x.C[:, 0]
@@ -78,12 +83,10 @@ class OffsetAttentionLayer(nn.Module):
         lengths = torch.tensor([f.shape[0] for f in grouped_features], device=features.device)
         key_padding_mask = torch.arange(padded.size(1), device=features.device)[None, :] >= lengths[:, None]
 
-        # Apply attention
+        # Self-attention
         attn_out, _ = self.attn(padded, padded, padded, key_padding_mask=key_padding_mask)
 
-        
-        # print(self.attn.in_proj_weight.shape)
-        # Remove padding and concatenate back
+        # Remove padding
         new_features = []
         for i, f in enumerate(grouped_features):
             length = f.shape[0]
@@ -91,7 +94,7 @@ class OffsetAttentionLayer(nn.Module):
 
         new_features = torch.cat(new_features, dim=0)
 
-        # Construct new SparseTensor with updated features
+        # Build new sparse tensor
         new_features = self.layer_nm(ME.SparseTensor(features=new_features,
                                                      coordinate_map_key=x.coordinate_map_key,
                                                      coordinate_manager=x.coordinate_manager))
@@ -175,11 +178,10 @@ class MinkEncClsConvNeXtV2(nn.Module):
     def forward(self, x, x_glob):
         """Encoder"""
         # Ensure x_glob is on the same device as x
-        x_glob = x_glob.to(x.device)  # Move x_glob to the same device as x
+        x_glob = x_glob.to(x.device)  
 
         # stem
         x = self.stem(x)
-    
         
         x_glob = self.global_mlp(x_glob)
 
