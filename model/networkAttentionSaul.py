@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from timm.models.layers import trunc_normal_
 from torch.nn.utils.rnn import pad_sequence
 
+
 from .utils import (
     Block,
     LayerNorm,
@@ -52,117 +53,125 @@ def _init_weights(m):
         nn.init.constant_(m.bias, 0)
         nn.init.constant_(m.weight, 1.0)
 
-import math    
 
 '''MODEL'''
-class OffsetAttentionLayer(nn.Module):
-    def __init__(self, embed_dim, max_seq_len=200):
+class RelPosSelfAttention(nn.Module):
+    def __init__(self, d_model, nhead):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads=1, batch_first=True)
-        self.pos_embed = nn.Embedding(max_seq_len, embed_dim)
-        # Initialize with truncated normal distribution (ViT paper)
-        trunc_normal_(self.pos_embed.weight, std=0.02)
+        self.nhead = nhead
+        self.scale = (d_model // nhead) ** -0.5
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.out = nn.Linear(d_model, d_model)
         
-        self.norm = nn.BatchNorm1d(embed_dim)
-        self.relu = nn.ReLU()
+        self.coord_dim = 2  # Match the dimension of your coordinates
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(self.coord_dim, nhead*4),
+            nn.GELU(), 
+            nn.Linear(nhead*4, nhead)
+        )
         
-        # for interpretability/debugging
-        self.attn_weights = None  
-        self.input_tokens = None
-        self.pos_embeddings = None
-
-    def get_positional_embeddings(self, batch_indices):
-        """
-        Returns learned positional embeddings using ViT-style embedding approach.
+        # For debugging
+        self.attn_weights = None
+    
+    def forward(self, x, coords, src_key_padding_mask=None):
+        B, N, _ = x.shape
+        qkv = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = [t.view(B, N, self.nhead, -1).transpose(1, 2) for t in qkv]
         
-        Args:
-            batch_indices: Tensor of shape [N_total] containing batch/event indices.
-            
-        Returns:
-            Tensor of shape [N_total, embed_dim] with positional embeddings.
-        """
-        device = batch_indices.device
+        # coords: [B,N,3] as (x,y,z)
+        ci, cj = coords.unsqueeze(2), coords.unsqueeze(1)  # [B,N,1,3], [B,1,N,3]
+        dpos = ci - cj  # [B,N,N,3]
+        bias = self.bias_mlp(dpos).permute(0, 3, 1, 2)  # [B,heads,N,N]
         
-        # Get unique batch indices and count points per batch
-        unique_batches, counts = torch.unique(batch_indices, return_counts=True)
+        dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
+        logits = dots + bias
         
-        # Create position IDs for each point 
-        position_ids = []
-        for b, count in zip(unique_batches, counts):
-            position_ids.append(torch.arange(count, device=device))
+        if src_key_padding_mask is not None:
+            key_mask = src_key_padding_mask.unsqueeze(1).unsqueeze(2)
+            logits = logits.masked_fill(key_mask, float('-inf'))
         
-        # Concatenate to match original tensor shape
-        position_ids = torch.cat(position_ids)
+        attn = torch.softmax(logits, dim=-1)
+        self.attn_weights = attn  # Store for debugging
         
-        # Look up the embeddings from the embedding table (nn.Embedding())
-        pos_embeddings = self.pos_embed(position_ids)
-        self.pos_embeddings = pos_embeddings
-        
-        return pos_embeddings  # shape: [N_total, embed_dim]
+        out = torch.einsum('bhij,bhjd->bhid', attn, v)
+        out = out.transpose(1, 2).reshape(B, N, -1)
+        return self.out(out)
 
 
+class RelPosEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dropout=0.1):
+        super().__init__()
+        self.self_attn = RelPosSelfAttention(d_model, nhead)
+        self.linear1 = nn.Linear(d_model, d_model*4)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_model*4, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model) 
+        self.act = nn.ReLU()
+    
+    def forward(self, src, coords, src_key_padding_mask=None):
+        src2 = self.self_attn(src, coords, src_key_padding_mask)
+        src = src + self.dropout(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.act(self.linear1(src))))
+        src = src + self.dropout(src2)
+        return self.norm2(src)
+
+
+class SparseRelPosAttentionAdapter(nn.Module):
+    """
+    Adapter class that converts SparseTensor to dense tensors for RelPosSelfAttention
+    and converts the result back to SparseTensor
+    """
+    def __init__(self, d_model, nhead=1, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([                     
+            RelPosEncoderLayer(d_model, nhead, dropout),
+            # RelPosEncoderLayer(d_model, nhead, dropout),
+        ])
+    
     def forward(self, x: ME.SparseTensor):
         features = x.F
-        batch_indices = x.C[:, 0]
-
-        # Add learned positional encoding based on hit order
-        pos_enc = self.get_positional_embeddings(batch_indices)
+        coordinates = x.C  # Get coordinates including batch index
+        batch_indices = coordinates[:, 0]  # Extract batch indices
         
-        # Store original features for residual connection
-        residual = features.clone()
-        
-        # Add positional encoding after normalization
-        features = features + pos_enc
-
-        # Group by batch
+        # Group features by batch
         unique_batches = batch_indices.unique(sorted=True)
-        grouped = [features[batch_indices == b] for b in unique_batches]
-
-        # Pad to create [B, N_max, D] for attention
-        padded = pad_sequence(grouped, batch_first=True)
-
-        lengths = torch.tensor([g.shape[0] for g in grouped], device=features.device)
-        key_padding_mask = torch.arange(padded.size(1), device=features.device).unsqueeze(0) >= lengths.unsqueeze(1)
-
-        # Apply attention
-        attn_out, self.attn_weights = self.attn(
-            padded, padded, padded,
-            key_padding_mask=key_padding_mask,
-            need_weights=True
-        )
-        self.input_tokens = padded.detach().cpu()
-
-        # Remove padding and restore [N_total, D]
-        unpadded = torch.cat([attn_out[i, :l] for i, l in enumerate(lengths)], dim=0)
+        grouped_features = [features[batch_indices == b] for b in unique_batches]
+        grouped_coords = [coordinates[batch_indices == b, 1:].float() for b in unique_batches]  # Spatial coords only
         
-        # Apply BatchNorm and Relu
-        att = self.norm(unpadded + residual)
-        out = self.relu(att)
+        # Get batch sizes
+        batch_sizes = [f.shape[0] for f in grouped_features]
         
-        # Return new Sparse Tensor with updated features and residual connection
+        # Create padding mask for attention
+        max_len = max(batch_sizes)
+        B = len(unique_batches)
+        key_padding_mask = torch.zeros((B, max_len), dtype=torch.bool, device=features.device)
+        for i, size in enumerate(batch_sizes):
+            key_padding_mask[i, size:] = True
+        
+        # Pad sequences for batch processing
+        padded_features = pad_sequence(grouped_features, batch_first=True)  # [B, N_max, D]
+        padded_coords = pad_sequence(grouped_coords, batch_first=True)  # [B, N_max, 3]
+        
+        # Process through the layers
+        out = padded_features
+        for layer in self.layers:
+            out = layer(out, padded_coords, key_padding_mask)
+        
+        # Unpad to recover sparse structure
+        unpadded = torch.cat([out[i, :size] for i, size in enumerate(batch_sizes)], dim=0)
+        
+        # Return as SparseTensor with original coordinate structure
         return ME.SparseTensor(
-            features=out,
+            features=unpadded,
             coordinate_map_key=x.coordinate_map_key,
             coordinate_manager=x.coordinate_manager
         )
 
 
-class OffsetAttentionModule(nn.Module):
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.layer1 = OffsetAttentionLayer(embed_dim)
-        self.layer2 = OffsetAttentionLayer(embed_dim)
-        self.layer3 = OffsetAttentionLayer(embed_dim)
-
-    def forward(self, x):
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        return x
-
 class MinkEncClsConvNeXtV2(nn.Module):
-    def __init__(self, in_channels, out_channels, D=2, args=None): #D=2 important (2D images here)
+    def __init__(self, in_channels, out_channels, D=2, args=None): # D=2 important (2D images here)
         nn.Module.__init__(self)
         self.is_v5 = True if 'v5' in args.dataset_path else False 
 
@@ -204,11 +213,12 @@ class MinkEncClsConvNeXtV2(nn.Module):
                 )
                 self.downsample_layers.append(downsample_layer)
         
-        """NEW: Batch Normalization"""
-        self.batch_norm = MinkowskiBatchNorm(dims[-1], eps=1e-6)
+        """NEW: Layer Normalization"""
+        self.layer_norm_ba = MinkowskiLayerNorm(dims[-1], eps=1e-6)
 
         """Offset Attention module"""
-        self.offset_attn = OffsetAttentionModule(embed_dim=dims[-1])
+        self.offset_attn = SparseRelPosAttentionAdapter(d_model=dims[-1])
+
 
         """Classification/regression layers"""
         self.global_pool = MinkowskiGlobalMaxPooling()
@@ -247,8 +257,8 @@ class MinkEncClsConvNeXtV2(nn.Module):
                 x_enc.append(x)
                 x = self.downsample_layers[i](x)
 
-        # Barch Nomr
-        x = self.batch_norm(x)
+        # Layer Nomr
+        x = self.layer_norm_ba(x)
         
         # offset attention
         x = self.offset_attn(x)

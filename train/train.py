@@ -7,90 +7,51 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 from types import SimpleNamespace
+from torch.utils.tensorboard import SummaryWriter
 
 import MinkowskiEngine as ME
 
-# Add project root to path
+# === Paths and TensorBoard ===
+def get_new_log_dir(base_dir="tb_logs", prefix="v"):
+    """Automatically create a new subfolder like tb_logs/v1/"""
+    os.makedirs(base_dir, exist_ok=True)
+    existing = [d for d in os.listdir(base_dir) if d.startswith(prefix) and d[len(prefix):].isdigit()]
+    version = 1 + max([int(d[len(prefix):]) for d in existing], default=0)
+    new_log_dir = os.path.join(base_dir, f"{prefix}{version}")
+    os.makedirs(new_log_dir, exist_ok=True)
+    return new_log_dir
+
+LOG_DIR = get_new_log_dir()
+writer = SummaryWriter(log_dir=LOG_DIR)
+print(f"TensorBoard logs will be written to: {LOG_DIR}")
+
+# === Import custom modules ===
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from utils.funcs import *
 from dataset.dataset import XYProjectionFASERCALDataset
-from model.networkAttention import MinkEncClsConvNeXtV2
+from model.networkAttentionSaul import MinkEncClsConvNeXtV2
 
 
-# === Plotting function ===
-def save_loss_plot(train_losses, val_losses, folder="plots", version=1):
-    filename = os.path.join(folder, f"v{version}.png")
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label="Train Loss", marker='o')
-    plt.plot(val_losses, label="Validation Loss", marker='x')
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training vs Validation Loss")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(filename)
-    plt.close()
-
-    print(f"[Epoch {len(train_losses)}] Saved loss plot to {filename}")
-
-
-# === Optional: attention visualization utilities ===
-def plot_token_strength(tokens, title="Token Norms First Batch Event"):
-    plt.figure(figsize=(12, 10))
-    aver_chan = torch.max(tokens, dim=2)[0].cpu().numpy()
-
-    ax1 = plt.subplot(2, 1, 1)
-    im = ax1.imshow(aver_chan, aspect='auto')
-    ax1.set_title(title)
-    ax1.set_xlabel("Token Index")
-    ax1.set_ylabel("Event Index")
-    plt.colorbar(im, ax=ax1)
-
-    x = np.arange(aver_chan.shape[1])
-    y = aver_chan[0]
-    ax2 = plt.subplot(2, 1, 2)
-    ax2.scatter(x, y, c='red')
-    ax2.set_xlabel("Token Index")
-    ax2.set_ylabel("Token Strength (First Event)")
-    ax2.set_title("Token Strengths - First Event (Scatter)")
-
-    plt.tight_layout()
-    plt.savefig('token_strength.png')
-    plt.close()
-
-
-def plot_and_save_attention(attn_weights, filename="attention.png", layer_idx=1, step=0):
-    attn = attn_weights[0]
-    attn = attn.squeeze().detach().cpu().numpy()
-
-    plt.figure(figsize=(10, 6))
-    plt.imshow(attn, aspect='auto', cmap='viridis')
-    plt.colorbar()
-    plt.xlabel('Key Tokens')
-    plt.ylabel('Query Tokens')
-    plt.title(f'Attention Weights - Layer {layer_idx}, {attn.shape}, Step {step}')
-    plt.savefig(filename)
-    plt.close()
-
-
-# === Training Setup ===
-args = SimpleNamespace()
-args.dataset_path = "/scratch/salonso/sparse-nns/faser/events_v5.1"
-args.sets_path = "/scratch/salonso/sparse-nns/faser/events_v5.1/sets.pkl"
-args.batch_size = 32
-args.num_workers = 12
-args.augmentations_enabled = False
-args.train = True
+# === Configurations ===
+args = SimpleNamespace(
+    dataset_path="/scratch/salonso/sparse-nns/faser/events_v5.1",
+    sets_path="/scratch/salonso/sparse-nns/faser/events_v5.1/sets.pkl",
+    batch_size=32,
+    num_workers=12,
+    augmentations_enabled=False,
+    train=True
+)
 
 version = 2
+num_epochs = 50
 
+# === Data ===
 dataset = XYProjectionFASERCALDataset(args)
-print("- Dataset size: {} events".format(len(dataset)))
+print(f"- Dataset size: {len(dataset)} events")
 train_loader, valid_loader, test_loader = split_dataset(dataset, args, splits=[0.6, 0.1, 0.3])
 
+# === Model Setup ===
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = MinkEncClsConvNeXtV2(in_channels=1, out_channels=4, args=args).to(device)
 
@@ -104,32 +65,30 @@ optimizer = optim.AdamW(
 )
 
 # === Training Loop ===
-num_epochs = 50
 best_val_loss = float('inf')
-
 train_losses = []
 val_losses = []
+step_tr = 0
+step_val = 0
 
 for epoch in range(1, num_epochs + 1):
+    # === Training ===
     model.train()
     total_loss = 0
-
-    for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch} - Training"):
+        step_tr += 1
         batch_input, batch_input_global = arrange_sparse_minkowski(batch, device)
         target = arrange_truth(batch)
         y = target["flavour_label"].to(device)
 
         optimizer.zero_grad()
         out = model(batch_input, batch_input_global)
-        out["out_flavour"] = out["out_flavour"].to(device)
         loss = loss_fn(out["out_flavour"], y)
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-        # token = model.offset_attn.layer1.input_tokens
-        # plot_token_strength(token, title=f"Token Norms First Batch Event - Epoch {epoch}")
-
+        writer.add_scalar("Loss/train", loss.item(), step_tr)
 
     avg_loss = total_loss / len(train_loader)
     train_losses.append(avg_loss)
@@ -139,27 +98,29 @@ for epoch in range(1, num_epochs + 1):
     model.eval()
     val_loss = 0
     with torch.no_grad():
-        for batch in tqdm(valid_loader, desc=f"Validation Epoch {epoch}"):
+        for batch in tqdm(valid_loader, desc=f"Epoch {epoch} - Validation"):
+            step_val += 1
             batch_input, batch_input_global = arrange_sparse_minkowski(batch, device)
             target = arrange_truth(batch)
             y = target["flavour_label"].to(device)
 
             out = model(batch_input, batch_input_global)
-            out["out_flavour"] = out["out_flavour"].to(device)
             loss = loss_fn(out["out_flavour"], y)
             val_loss += loss.item()
+
+            writer.add_scalar("Loss/val", loss.item(), step_val)
 
     avg_val_loss = val_loss / len(valid_loader)
     val_losses.append(avg_val_loss)
     print(f"Epoch {epoch} - Validation Loss: {avg_val_loss:.4f}")
 
-    # Save best model
+    # === Save Best Model ===
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        print(f"Validation loss improved, saving model for epoch {epoch}...")
+        print(f"Validation loss improved, saving model (epoch {epoch})...")
         torch.save(model.state_dict(), "best_model.pth")
 
-    # === Save loss plot ===
-    save_loss_plot(train_losses, val_losses)
+writer.flush()
+writer.close()
 
 print("Training complete!")

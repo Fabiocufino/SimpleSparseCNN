@@ -1,2 +1,6 @@
 *.pth
 *.ipynb
+tb_logs/
+plots/
+__pycache__/
+*.pyc

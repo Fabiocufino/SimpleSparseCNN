@@ -8,10 +8,15 @@
 # URL: https://github.com/facebookresearch/ConvNeXt-V2/blob/main/models/utils.py
 
 import numpy.random as random
+import matplotlib.pyplot as plt
+
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+
 from MinkowskiEngine import (
     SparseTensor,
     MinkowskiConvolution,
@@ -155,3 +160,42 @@ class GRN(nn.Module):
         Gx = torch.norm(x, p=2, dim=(1,2), keepdim=True)
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
+
+
+
+
+
+# === Plotting Utilities ===
+def plot_token_strength(tokens, title="Token Norms First Batch Event"):
+    plt.figure(figsize=(12, 10))
+    aver_chan = torch.max(tokens, dim=2)[0].cpu().numpy()
+
+    ax1 = plt.subplot(2, 1, 1)
+    im = ax1.imshow(aver_chan, aspect='auto')
+    ax1.set_title(title)
+    ax1.set_xlabel("Token Index")
+    ax1.set_ylabel("Event Index")
+    plt.colorbar(im, ax=ax1)
+
+    x = np.arange(aver_chan.shape[1])
+    y = aver_chan[0]
+    ax2 = plt.subplot(2, 1, 2)
+    ax2.scatter(x, y, c='red')
+    ax2.set_xlabel("Token Index")
+    ax2.set_ylabel("Token Strength (First Event)")
+    ax2.set_title("Token Strengths - First Event (Scatter)")
+
+    plt.tight_layout()
+    plt.savefig('token_strength.png')
+    plt.close()
+
+def plot_and_save_attention(attn_weights, filename="attention.png", layer_idx=1, step=0):
+    attn = attn_weights[0].squeeze().detach().cpu().numpy()
+    plt.figure(figsize=(10, 6))
+    plt.imshow(attn, aspect='auto', cmap='viridis')
+    plt.colorbar()
+    plt.xlabel('Key Tokens')
+    plt.ylabel('Query Tokens')
+    plt.title(f'Attention Weights - Layer {layer_idx}, {attn.shape}, Step {step}')
+    plt.savefig(filename)
+    plt.close()
