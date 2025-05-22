@@ -11,6 +11,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 import MinkowskiEngine as ME
 
+
+# == Seeds ==
+torch.manual_seed(42)
+np.random.seed(42)
+
 # === Paths and TensorBoard ===
 def get_new_log_dir(base_dir="tb_logs", prefix="v"):
     """Automatically create a new subfolder like tb_logs/v1/"""
@@ -58,7 +63,8 @@ model = MinkEncClsConvNeXtV2(in_channels=1, out_channels=4, args=args).to(device
 loss_fn = nn.CrossEntropyLoss()
 optimizer = optim.AdamW(
     filter(lambda p: p.requires_grad, model.parameters()),
-    lr=1e-3,
+    lr=2e-4,
+    # lr=1e-3,
     betas=(0.9, 0.999),
     eps=1e-8,
     weight_decay=1e-4
@@ -89,6 +95,14 @@ for epoch in range(1, num_epochs + 1):
 
         total_loss += loss.item()
         writer.add_scalar("Loss/train", loss.item(), step_tr)
+
+    
+    bias = model.offset_attn.layers[0].self_attn.bias
+    dots = model.offset_attn.layers[0].self_attn.dots
+
+    print(f"Bias: mean={torch.mean(bias).item():.4f}, std={torch.std(bias).item():.4f}")
+    print(f"Dots: mean={torch.mean(dots).item():.4f}, std={torch.std(dots).item():.4f}")
+
 
     avg_loss = total_loss / len(train_loader)
     train_losses.append(avg_loss)

@@ -72,6 +72,8 @@ class RelPosSelfAttention(nn.Module):
         
         # For debugging
         self.attn_weights = None
+        self.bias = None
+        self.dots = None
     
     def forward(self, x, coords, src_key_padding_mask=None):
         B, N, _ = x.shape
@@ -85,6 +87,8 @@ class RelPosSelfAttention(nn.Module):
         
         dots = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
         logits = dots + bias
+        self.bias = bias 
+        self.dots = dots 
         
         if src_key_padding_mask is not None:
             key_mask = src_key_padding_mask.unsqueeze(1).unsqueeze(2)
@@ -123,7 +127,7 @@ class SparseRelPosAttentionAdapter(nn.Module):
     Adapter class that converts SparseTensor to dense tensors for RelPosSelfAttention
     and converts the result back to SparseTensor
     """
-    def __init__(self, d_model, nhead=1, dropout=0.1):
+    def __init__(self, d_model, nhead=8, dropout=0.1):
         super().__init__()
         self.layers = nn.ModuleList([                     
             RelPosEncoderLayer(d_model, nhead, dropout),
@@ -131,9 +135,12 @@ class SparseRelPosAttentionAdapter(nn.Module):
         ])
     
     def forward(self, x: ME.SparseTensor):
+        
         features = x.F
         coordinates = x.C  # Get coordinates including batch index
+
         batch_indices = coordinates[:, 0]  # Extract batch indices
+
         
         # Group features by batch
         unique_batches = batch_indices.unique(sorted=True)
@@ -163,11 +170,15 @@ class SparseRelPosAttentionAdapter(nn.Module):
         unpadded = torch.cat([out[i, :size] for i, size in enumerate(batch_sizes)], dim=0)
         
         # Return as SparseTensor with original coordinate structure
-        return ME.SparseTensor(
+
+        result = ME.SparseTensor(
             features=unpadded,
             coordinate_map_key=x.coordinate_map_key,
             coordinate_manager=x.coordinate_manager
         )
+
+        return result
+
 
 
 class MinkEncClsConvNeXtV2(nn.Module):
@@ -260,7 +271,7 @@ class MinkEncClsConvNeXtV2(nn.Module):
         # Layer Nomr
         x = self.layer_norm_ba(x)
         
-        # offset attention
+        # # offset attention
         x = self.offset_attn(x)
         
         # event predictions
